@@ -1,23 +1,60 @@
 name: Build FortiGate images
 
+# This file lives on the default branch of the fork (ci-build) and builds
+# another ref, by default main. GitHub reads push workflows from the pushed
+# commit, so main (the head of the upstream PR) stays free of it.
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or commit to build (a tag v* also creates a release)'
+        default: 'main'
+  schedule:
+    - cron: '17 * * * *'
   push:
-    branches: [main]
-    tags:
-      - 'v*'
+    branches: [ci-build]
     paths:
       - '.github/workflows/build-images.yml'
-      - 'target/**'
-      - 'package/**'
-      - 'include/**'
-      - 'scripts/**'
+
+# A build takes longer than the schedule interval: one at a time, the queued
+# run then finds the marker and skips.
+concurrency:
+  group: build-images-${{ inputs.ref || 'main' }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.ref.outputs.ref }}
+      sha: ${{ steps.ref.outputs.sha }}
+      skip: ${{ steps.done.outputs.cache-hit }}
+    steps:
+      - id: ref
+        env:
+          REF: ${{ inputs.ref || 'main' }}
+        run: |
+          sha=$(git ls-remote "https://github.com/${{ github.repository }}" "$REF" "refs/tags/$REF^{}" | tail -1 | cut -f1)
+          [ -n "$sha" ] || sha="$REF"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "built-$sha" > marker
+
+      # Scheduled runs skip a commit that was already built (marker in the cache)
+      - id: done
+        if: github.event_name == 'schedule'
+        uses: actions/cache/restore@v4
+        with:
+          path: marker
+          key: built-${{ steps.ref.outputs.sha }}
+          lookup-only: true
+
   build:
+    needs: check
+    if: needs.check.outputs.skip != 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -60,7 +97,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 'main'
+          ref: ${{ needs.check.outputs.sha }}
 
       - name: Install build deps
         run: |
@@ -97,9 +134,19 @@ jobs:
           name: ${{ matrix.id }}
           path: out/${{ matrix.id }}
 
+  done:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "built-${{ needs.check.outputs.sha }}" > marker
+      - uses: actions/cache/save@v4
+        with:
+          path: marker
+          key: built-${{ needs.check.outputs.sha }}
+
   release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [check, build]
+    if: startsWith(needs.check.outputs.ref, 'v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -110,8 +157,9 @@ jobs:
 
       - uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ needs.check.outputs.ref }}
           files: |
             out/**/openwrt-*-initramfs-kernel.bin
-            out/**/SHA256SUMS-*.txt
+            out/**/SHA256SUMS
           draft: false
           prerelease: false
